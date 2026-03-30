@@ -1,0 +1,35 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  backend:
+    build: 
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: rdec-backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Passes your local .env API key securely into the container
+      - GOOGLE_ADK_API_KEY=${GOOGLE_API_KEY}
+      - FRONTEND_URL=http://localhost:3000
+    volumes:
+      # CRITICAL: This maps the container's data folder to your local machine.
+      # If the container stops or restarts, the tax forms/audit logs are NOT lost!
+      - ./backend/data:/app/data
+    restart: unless-stopped
+
+  frontend:
+    build: 
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: rdec-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - backend
+    restart: unless-stopped

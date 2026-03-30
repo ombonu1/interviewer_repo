@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pydantic
+sqlalchemy
+psycopg[binary]
+google-adk
+python-dotenv
+python-docx
+PyPDF2
