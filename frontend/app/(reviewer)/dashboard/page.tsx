@@ -1,12 +1,17 @@
 'use client';
 import { useState, useEffect } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import toast from 'react-hot-toast';
 
-// 1. USE THE ENVIRONMENT VARIABLE
+// Sub-components (Ensure these are in your components/reviewer folder)
+import SubmissionTable from '../../../components/reviewer/SubmissionTable';
+import AuditModal from '../../../components/reviewer/AuditModal';
+import { Highlight } from '../../../components/reviewer/Highlight';
+import SubmissionCard from '../../../components/reviewer/SubmissionCard';
+
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
-// 2. DEFINE STRICT TYPES (Eliminates 'any' abuse)
 interface SubmissionSummary {
   id: string;
   project_name: string;
@@ -15,679 +20,621 @@ interface SubmissionSummary {
   has_been_audited: boolean;
 }
 
-interface HumanMessage {
-  sender: 'tax_team' | 'client';
-  message: string;
-  timestamp: string;
-}
-
-interface AuditLogEntry {
-  timestamp: string;
-  ai_question: string;
-  user_answer: string;
-  extracted_fields?: string[];
-}
-
-interface CopilotAnalysis {
-  confidence_score: number;
-  red_flags: string[];
-  positive_notes: string[];
-  client_email_draft: string;
-}
-
-interface FullSubmission {
-  session_id: string;
-  status: string;
-  aif_state: {
-    company_details?: { company_name?: string; competent_professional_details?: string };
-    financials?: { staff_costs?: number; subcontractor_costs?: number; software?: number; cloud?: number };
-    project_narratives?: Array<{ project_name?: string; advance_sought?: string; scientific_uncertainties?: string; outcomes?: string }>;
-    compliance?: { overseas_rnd?: boolean; ai_used?: boolean };
-  };
-  audit_summary: {
-    completeness_score: number;
-    compliance_score: number;
-    summary_text: string;
-    detailed_log: AuditLogEntry[];
-  };
-  reviewer_analysis?: CopilotAnalysis;
-}
-
 export default function ReviewerHub() {
+  const router = useRouter();
   const [submissions, setSubmissions] = useState<SubmissionSummary[]>([]);
-  const [selectedSubmission, setSelectedSubmission] = useState<FullSubmission | null>(null);
+  const [selectedSubmission, setSelectedSubmission] = useState<any | null>(null);
   
-  // Copilot States
+  // AI Copilot & Chat States
   const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [analysis, setAnalysis] = useState<CopilotAnalysis | null>(null);
+  const [analysis, setAnalysis] = useState<any | null>(null);
   const [chatInput, setChatInput] = useState('');
+  const [humanMessages, setHumanMessages] = useState<any[]>([]);
   
-  // UI States
+  // UI & Flow States
   const [activeComment, setActiveComment] = useState<string | null>(null);
   const [showAuditModal, setShowAuditModal] = useState(false);
-  const [humanMessages, setHumanMessages] = useState<HumanMessage[]>([]);
+  const [manualInstruction, setManualInstruction] = useState('');
+  const [dismissedIssues, setDismissedIssues] = useState<string[]>([]);
+  
+  // Approval Flow States
+  const [showConfirmModal, setShowConfirmModal] = useState(false);
+  const [isSuccessOverlay, setIsSuccessOverlay] = useState(false);
+  const [countdown, setCountdown] = useState(5);
 
-  // INITIAL FETCH
-  useEffect(() => {
-    fetchSubmissions();
-  }, []);
+  // --- 🔄 DATA FETCHING & POLLING ---
 
-  // REAL-TIME POLLING FOR HUMAN CHAT
+  useEffect(() => { fetchSubmissions(); }, []);
+
+  // Human Chat Polling
   useEffect(() => {
     if (!selectedSubmission) return;
-    
-    // Initial fetch
-    const fetchChat = () => {
-      fetch(`${API_BASE}/api/chat/human/${selectedSubmission.session_id}`)
-        .then(res => res.json())
-        .then(data => setHumanMessages(data))
-        .catch(err => console.error("Failed to load chat", err));
+    const fetchChat = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/chat/human/${selectedSubmission.session_id}`);
+        const data = await res.json();
+        setHumanMessages(data);
+      } catch (err) { console.error("Poll error", err); }
     };
-    
     fetchChat();
-    
-    // Poll every 3 seconds for new messages
     const interval = setInterval(fetchChat, 3000);
-    return () => clearInterval(interval); // Cleanup to prevent memory leaks
+    return () => clearInterval(interval);
   }, [selectedSubmission]);
 
-  // AUTO-RUN THE AI WHEN A FILE IS OPENED
+  // Trigger Copilot on Open
   useEffect(() => {
-    if (selectedSubmission && !analysis && !isAnalyzing) {
-      runCopilot();
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (selectedSubmission && !analysis && !isAnalyzing) runCopilot();
   }, [selectedSubmission]);
 
-  // --- API FUNCTIONS ---
+  // Redirection Countdown Timer
+  useEffect(() => {
+    let timer: NodeJS.Timeout;
+    if (isSuccessOverlay && countdown > 0) {
+      timer = setTimeout(() => setCountdown(countdown - 1), 1000);
+    } else if (isSuccessOverlay && countdown === 0) {
+      handleBackToQueue();
+    }
+    return () => clearTimeout(timer);
+  }, [isSuccessOverlay, countdown]);
+
+  // --- 🛠️ API ACTIONS ---
 
   const fetchSubmissions = async () => {
-    try {
-      const res = await fetch(`${API_BASE}/api/submissions`, { cache: 'no-store' });
-      if (res.ok) {
-        const data = await res.json();
-        setSubmissions(data);
-      }
-    } catch (e) {
-      console.error("Failed to fetch submissions", e);
-    }
+    const res = await fetch(`${API_BASE}/api/submissions`);
+    if (res.ok) setSubmissions(await res.json());
+  };
+
+  const handleDismissIssue = (id: string) => {
+    setDismissedIssues(prev => [...prev, id]);
+    setActiveComment(null); 
   };
 
   const openSubmission = async (id: string) => {
-    try {
-      const res = await fetch(`${API_BASE}/api/submissions/${id}`);
-      if (res.ok) {
-        const data = await res.json();
-        setSelectedSubmission(data);
-        setAnalysis(null); 
-        setChatInput('');
-        setActiveComment(null);
-      }
-    } catch (e) {
-      console.error("Failed to fetch details", e);
+    const res = await fetch(`${API_BASE}/api/submissions/${id}`);
+    if (res.ok) {
+      setSelectedSubmission(await res.json());
+      setAnalysis(null);
+      setChatInput('');
+      setDismissedIssues([]); // Reset dismissed issues on new open
     }
   };
 
   const runCopilot = async () => {
-    if (!selectedSubmission) return;
     setIsAnalyzing(true);
     try {
-      const res = await fetch(`${API_BASE}/api/reviewer/analyze/${selectedSubmission.session_id}`, {
-        method: 'POST'
+      const res = await fetch(`${API_BASE}/api/reviewer/analyze/${selectedSubmission.session_id}`, { method: 'POST' });
+      const data = await res.json();
+      setAnalysis(data);
+      setChatInput(data.client_email_draft || '');
+    } finally { setIsAnalyzing(false); }
+  };
+
+  const handleManualReRun = async () => {
+    if (!selectedSubmission) return;
+
+    setIsAnalyzing(true);
+    try {
+      // 1. If the box is empty, we give the AI a default instruction so it doesn't get confused.
+      // 2. We ALWAYS hit the 'analyze-manual' endpoint because it bypasses the cache!
+      const instructionToSend = manualInstruction.trim() !== '' 
+        ? manualInstruction 
+        : "Please perform a standard re-audit of the technical narrative to ensure all compliance scores and flags are accurate and up to date.";
+
+      const res = await fetch(`${API_BASE}/api/reviewer/analyze-manual/${selectedSubmission.session_id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ instruction: instructionToSend })
       });
-      if (res.ok) {
-        const data = await res.json();
-        setAnalysis(data);
-        setChatInput(data.client_email_draft);
-      }
-    } catch (e) {
-      console.error("Copilot failed", e);
+
+      if (!res.ok) throw new Error("Manual re-run failed");
+
+      const newAnalysis = await res.json();
+      
+      // Update the UI with the fresh data
+      setAnalysis(newAnalysis);
+      setSelectedSubmission((prev: any) => ({
+        ...prev,
+        reviewer_analysis: newAnalysis
+      }));
+
+      setDismissedIssues([]); 
+      setActiveComment(null);
+
+      toast.success("AI Re-audit complete!");
+      setManualInstruction(''); // Clear the box after success
+    } catch (err) {
+      console.error(err);
+      toast.error("Failed to re-run AI agent.");
     } finally {
       setIsAnalyzing(false);
     }
   };
 
-  const returnToClient = async () => {
-    if (!selectedSubmission) return;
-    
-    const fallbackMessage = "The Tax Team has returned this AIF for further clarification.";
-    const messageToSend = chatInput.trim() ? chatInput : fallbackMessage;
-
-    try {
-      await fetch(`${API_BASE}/api/reviewer/return/${selectedSubmission.session_id}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email_body: messageToSend })
-      });
-      toast.success("Message sent to client! Returning to queue...");
-      setSelectedSubmission(null);
-      fetchSubmissions(); 
-    } catch (e) {
-      console.error("Failed to return submission", e);
-    }
-  };
-
-  const approveAIF = async () => {
-    if (!selectedSubmission) return;
-    try {
-      await fetch(`${API_BASE}/api/reviewer/approve/${selectedSubmission.session_id}`, { method: 'POST' });
-      toast.success("AIF Approved! Audit log updated.");
-      setSelectedSubmission(null);
-      fetchSubmissions(); 
-    } catch (e) {
-      console.error("Failed to approve", e);
-    }
-  };
-
   const sendChatMessage = async () => {
-    if (!selectedSubmission || !chatInput.trim()) return;
+    if (!chatInput.trim()) return;
+    const msg = chatInput.trim();
+    setChatInput('');
     
-    const messageText = chatInput.trim();
-    setChatInput(''); 
-    
-    // Optimistic UI update
-    const optimisticMsg: HumanMessage = {
-      sender: 'tax_team',
-      message: messageText,
-      timestamp: new Date().toISOString()
-    };
-    setHumanMessages(prev => [...prev, optimisticMsg]);
+    // Optimistic Update
+    setHumanMessages(prev => [...prev, { sender: 'tax_team', message: msg, timestamp: new Date().toISOString() }]);
 
-    try {
-      await fetch(`${API_BASE}/api/chat/human/${selectedSubmission.session_id}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sender: 'tax_team', message: messageText })
-      });
-    } catch (e) {
-      console.error("Failed to send chat", e);
+    await fetch(`${API_BASE}/api/chat/human/${selectedSubmission.session_id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sender: 'tax_team', message: msg })
+    });
+  };
+
+  // --- 🛡️ APPROVAL & RETURN FLOW ---
+
+  const triggerApprovalFlow = () => setShowConfirmModal(true);
+
+  const executeApprove = async () => {
+    setShowConfirmModal(false);
+    const res = await fetch(`${API_BASE}/api/reviewer/approve/${selectedSubmission.session_id}`, { method: 'POST' });
+    if (res.ok) {
+      setIsSuccessOverlay(true);
+    } else {
+      toast.error("Failed to approve submission.");
     }
   };
 
-  // --- EXPORT FUNCTIONS ---
-
-  const downloadAuditAsWord = () => {
-    if (!selectedSubmission?.audit_summary?.detailed_log) return;
-    
-    const projectName = selectedSubmission.aif_state.project_narratives?.[0]?.project_name || 'Unnamed_Project';
-    
-    let htmlContent = `
-      <html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
-      <head><meta charset='utf-8'><title>Audit Log</title></head>
-      <body style="font-family: Arial, sans-serif; line-height: 1.6;">
-        <h2 style="color: #1e293b;">RDEC Interview Audit Log: ${projectName}</h2>
-        <p style="color: #64748b; font-size: 12px;">
-          <strong>Session ID:</strong> ${selectedSubmission.session_id}<br/>
-          <strong>Exported:</strong> ${new Date().toLocaleString()}
-        </p>
-        <hr style="border: 1px solid #e2e8f0; margin-bottom: 20px;"/>
-    `;
-
-    selectedSubmission.audit_summary.detailed_log.forEach((entry: AuditLogEntry) => {
-      htmlContent += `
-        <div style="margin-bottom: 24px;">
-          <p style="font-size: 11px; color: #94a3b8; margin-bottom: 4px;">${new Date(entry.timestamp).toLocaleString()}</p>
-          <p style="margin-top: 0;"><strong>AI Question:</strong><br/>${entry.ai_question}</p>
-          <p style="color: #1d4ed8;"><strong>Client Answer:</strong><br/>${entry.user_answer}</p>
-          ${entry.extracted_fields && entry.extracted_fields.length > 0 
-            ? `<p style="font-size: 11px; color: #059669; font-family: monospace;">[Extracted Fields: ${entry.extracted_fields.join(", ")}]</p>` 
-            : ''}
-        </div>
-        <hr style="border: 1px dashed #e2e8f0;"/>
-      `;
+  const handleReturn = async () => {
+    const res = await fetch(`${API_BASE}/api/reviewer/return/${selectedSubmission.session_id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email_body: chatInput })
     });
 
-    htmlContent += `</body></html>`;
-
-    const blob = new Blob(['\ufeff', htmlContent], { type: 'application/msword' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `Audit_Log_${projectName.replace(/[^a-zA-Z0-9]/g, '_')}.doc`; 
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    if (res.ok) {
+      toast.success("Returned to Client");
+      setSelectedSubmission(null);
+      fetchSubmissions();
+    } else {
+      toast.error("Failed to return submission.");
+    }
   };
 
-  // --- SMART HIGHLIGHT COMPONENT ---
-  const Highlight = ({ children, issueId, text }: { children: React.ReactNode, issueId: string, text: string }) => {
-    const hasFlags = analysis && analysis.red_flags && analysis.red_flags.length > 0;
-    if (!hasFlags) return <span className="font-semibold text-slate-900">{children}</span>;
-
-    const isActive = activeComment === issueId;
-    const isAnythingActive = activeComment !== null;
-
-    return (
-      <span className="relative inline-flex items-center">
-        <span 
-          onClick={(e) => {
-            e.stopPropagation();
-            setActiveComment(isActive ? null : issueId);
-          }}
-          className={`cursor-pointer transition-colors duration-200 rounded px-1.5 py-0.5 font-semibold text-slate-900
-            ${isActive ? 'bg-amber-300 shadow-sm' : 'bg-amber-100 hover:bg-amber-200'} 
-            ${!isAnythingActive ? 'animate-pulse' : ''}
-          `}
-          title="Click to view AI comment"
-        >
-          {children}
-        </span>
-
-        {isActive && (
-          <div 
-            className="absolute left-[calc(100%+16px)] top-1/2 -translate-y-1/2 w-[320px] bg-white border border-amber-200 shadow-2xl rounded-xl p-4 z-50 animate-in fade-in slide-in-from-left-2 cursor-default"
-            onClick={(e) => e.stopPropagation()} 
-          >
-            <div className="absolute top-1/2 -translate-y-1/2 -left-2 w-4 h-4 bg-white border-l border-b border-amber-200 rotate-45"></div>
-            
-            <div className="flex items-center gap-2 mb-3 border-b border-slate-100 pb-2">
-              <div className="w-6 h-6 bg-amber-100 text-amber-700 rounded-full flex items-center justify-center font-bold text-[10px]">AI</div>
-              <span className="font-bold text-sm text-slate-800">Agent Review</span>
-            </div>
-            
-            <p className="text-sm text-slate-700 leading-relaxed font-sans mb-4">
-              {issueId === 'financials' 
-                ? "AI Flag: Ensure these software costs strictly relate to R&D activities and are not general enterprise licenses. Verify against the narrative."
-                : analysis.red_flags[0] || "AI Flag: This technical justification appears weak. Consider requesting more specific examples of experimental failure."
-              }
-            </p>
-            
-            <div className="flex justify-end">
-              <button 
-                onClick={(e) => { e.stopPropagation(); setActiveComment(null); }} 
-                className="text-xs font-bold text-slate-500 hover:text-slate-800 bg-slate-100 hover:bg-slate-200 px-3 py-1.5 rounded transition-colors"
-              >
-                Dismiss
-              </button>
-            </div>
-          </div>
-        )}
-      </span>
-    );
+  const handleBackToQueue = () => {
+    setIsSuccessOverlay(false);
+    setSelectedSubmission(null);
+    setCountdown(5);
+    fetchSubmissions();
   };
+
+  // State Lock Logic
+  const isReturned = selectedSubmission?.status === 'Returned';
+
+  // --- 🖼️ UI RENDER ---
 
   return (
-    <div className="h-screen w-full flex flex-col bg-slate-50 font-sans overflow-hidden">
-      
-      {/* --- DARK LOADING OVERLAY --- */}
-      {isAnalyzing && (
-        <div className="fixed inset-0 z-100 bg-slate-900/60 backdrop-blur-sm flex flex-col items-center justify-center animate-in fade-in duration-200">
-          <div className="bg-white p-8 rounded-2xl shadow-2xl flex flex-col items-center">
-            <svg className="animate-spin h-12 w-12 text-blue-600 mb-6" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-            <h2 className="text-2xl font-bold text-slate-800 mb-2">Agent is Auditing</h2>
-            <p className="text-slate-500 text-sm">Cross-referencing technical narratives and financials...</p>
+    <div className="h-screen w-full flex flex-col bg-slate-50 font-sans overflow-hidden relative">
+      {isAnalyzing && <LoadingOverlay />}
+
+      {/* 🟢 SUCCESS OVERLAY */}
+      {isSuccessOverlay && (
+        <div className="fixed inset-0 z-200 bg-slate-900 flex flex-col items-center justify-center text-white animate-in fade-in duration-500">
+          <div className="w-20 h-20 bg-emerald-500 rounded-full flex items-center justify-center mb-6 shadow-[0_0_40px_rgba(16,185,129,0.4)]">
+            <svg className="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M5 13l4 4L19 7" /></svg>
+          </div>
+          <h2 className="text-4xl font-bold mb-2">AIF Successfully Approved</h2>
+          <p className="text-slate-400 mb-8 text-lg">The file has been moved to the Approved Queries directory.</p>
+          <div className="flex gap-4">
+            <button onClick={handleBackToQueue} className="px-8 py-3 bg-white text-slate-900 rounded-xl font-bold hover:bg-slate-100 transition-all">
+              Return to Triage Queue ({countdown}s)
+            </button>
+            <button className="px-8 py-3 bg-slate-800 text-white rounded-xl font-bold hover:bg-slate-700 transition-all border border-slate-700">
+              View Approved Directory
+            </button>
           </div>
         </div>
       )}
 
-      {/* HEADER */}
-      {!selectedSubmission && (
-        <header className="flex-none h-16 bg-slate-900 border-b border-slate-800 flex items-center justify-between px-6 shadow-md z-10 text-white">
-          <div className="flex items-center gap-4">
-            <Link href="/" className="p-2 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition-colors">
-              <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
-            </Link>
-            <div className="h-6 w-px bg-slate-700"></div>
-            <div className="flex items-center gap-3">
-              <div className="w-8 h-8 bg-emerald-500/20 text-emerald-400 rounded flex items-center justify-center">
-                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+      {/* 🔴 CONFIRMATION MODAL */}
+      {showConfirmModal && (
+        <div className="fixed inset-0 z-150 bg-slate-900/70 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl shadow-2xl max-w-md w-full p-8 animate-in zoom-in-95 duration-200">
+            <h3 className="text-2xl font-bold text-slate-900 mb-4">Final Approval</h3>
+            <div className="space-y-4 mb-8">
+              <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100">
+                <div className="flex justify-between mb-2">
+                  <span className="text-slate-500 text-sm">Confidence Score:</span>
+                  <span className={`font-bold ${analysis?.confidence_score > 80 ? 'text-emerald-600' : 'text-amber-600'}`}>
+                    {analysis?.confidence_score}%
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500 text-sm">Active AI Flags:</span>
+                  <span className="font-bold text-red-500">
+                    {Math.max(0, Object.values(analysis?.section_flags || {}).filter(Boolean).length - dismissedIssues.length)}
+                  </span>
+                </div>
               </div>
-              <h1 className="font-semibold text-white tracking-wide">Reviewer Hub</h1>
+              <p className="text-amber-700 bg-amber-50 p-4 rounded-xl text-xs font-medium leading-relaxed border border-amber-200">
+                ⚠️ Warning: This action is irreversible. Approving this AIF will lock the document and move it to the final submission archive.
+              </p>
+            </div>
+            <div className="flex gap-3">
+              <button onClick={() => setShowConfirmModal(false)} className="flex-1 py-3 text-slate-600 font-bold hover:bg-slate-100 rounded-xl transition-all">Cancel</button>
+              <button onClick={executeApprove} className="flex-1 py-3 bg-slate-900 text-white font-bold rounded-xl hover:bg-emerald-600 transition-all shadow-lg">Confirm Approval</button>
             </div>
           </div>
-        </header>
+        </div>
       )}
 
-      <div className="flex-1 flex overflow-hidden">
-        
-        {!selectedSubmission ? (
-          /* --- THE QUEUE VIEW --- */
-          <div className="flex-1 p-8 overflow-y-auto">
-            <div className="max-w-5xl mx-auto">
-              <div className="flex justify-between items-end mb-8">
-                <div>
-                  <h2 className="text-3xl font-bold text-slate-900 mb-2">AIF Triage Queue</h2>
-                  <p className="text-slate-500">Review and audit client submissions before generating official HMRC documents.</p>
+      {!selectedSubmission ? (
+        <div className="flex-1 overflow-hidden flex flex-col">
+            <header className="flex-none h-16 bg-white border-b border-slate-200 flex items-center justify-between px-6 z-10">
+                <div className="flex items-center gap-4">
+                    <h1 className="font-bold text-slate-800 text-lg">Reviewer Hub</h1>
                 </div>
-                <button onClick={fetchSubmissions} className="px-4 py-2 bg-white border border-slate-200 text-slate-600 rounded-lg shadow-sm hover:bg-slate-50 text-sm font-semibold flex items-center gap-2 transition-colors">
-                  Refresh Queue
+                <button className="flex items-center gap-2 px-4 py-2 bg-emerald-50 text-emerald-700 rounded-lg text-sm font-bold border border-emerald-100 hover:bg-emerald-100 transition-all">
+                    📁 Approved Queries
                 </button>
-              </div>
+            </header>
+            <QueueView submissions={submissions} onRefresh={fetchSubmissions} onOpen={openSubmission} />
+        </div>
+      ) : (
+        <WorkbenchView 
+          submission={selectedSubmission} 
+          messages={humanMessages}
+          analysis={analysis}
+          chatInput={chatInput}
+          setChatInput={setChatInput}
+          activeComment={activeComment}
+          setActiveComment={setActiveComment}
+          manualInstruction={manualInstruction}
+          setManualInstruction={setManualInstruction}
+          handleManualReRun={handleManualReRun}
+          isAnalyzing={isAnalyzing}
+          onBack={() => setSelectedSubmission(null)}
+          onShowAudit={() => setShowAuditModal(true)}
+          onSendChat={sendChatMessage}
+          onApprove={triggerApprovalFlow}
+          onReturn={handleReturn}
+          dismissedIssues={dismissedIssues}
+          handleDismissIssue={handleDismissIssue}
+          isReturned={isReturned}
+        />
+      )}
 
-              <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
-                <table className="w-full text-left border-collapse">
-                  <thead>
-                    <tr className="bg-slate-50 border-b border-slate-200 text-xs uppercase tracking-wider text-slate-500 font-semibold">
-                      <th className="p-4">Project Name</th>
-                      <th className="p-4">Status</th>
-                      <th className="p-4 text-center">AI Compliance Score</th>
-                      <th className="p-4 text-right">Action</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {submissions.length === 0 ? (
-                      <tr><td colSpan={4} className="p-8 text-center text-slate-400 italic">No submissions pending review.</td></tr>
-                    ) : (
-                      submissions.map((sub, idx) => (
-                        <tr key={idx} className="hover:bg-slate-50 transition-colors">
-                          <td className="p-4 font-semibold text-slate-800">{sub.project_name}</td>
-                          <td className="p-4">
-                            <span className={`px-2.5 py-1 text-xs font-bold rounded-full ${sub.status === 'Needs Review' ? 'bg-amber-100 text-amber-700' : sub.status === 'Approved' ? 'bg-emerald-100 text-emerald-700' : 'bg-blue-100 text-blue-700'}`}>
-                              {sub.status}
-                            </span>
-                          </td>
-                          <td className="p-4 text-center">
-                            <span className={`text-lg font-black ${sub.compliance_score < 90 ? 'text-red-500' : 'text-emerald-500'}`}>
-                              {sub.compliance_score}%
-                            </span>
-                          </td>
-                          <td className="p-4 text-right">
-                            <button onClick={() => openSubmission(sub.id)} className={`px-4 py-2 text-sm font-semibold rounded transition shadow-sm ${sub.status === 'Approved' ? 'bg-emerald-100 text-emerald-700 hover:bg-emerald-200' : 'bg-slate-900 text-white hover:bg-slate-800'}`}>
-                              {sub.status === 'Approved' ? 'View Approved' : (sub.has_been_audited ? 'Continue Auditing' : 'Start Audit')}
-                            </button>
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-        ) : (
-          /* --- THE WORKBENCH VIEW --- */
-          <div className="flex-1 flex w-full h-full overflow-hidden">
-            
-            {/* LEFT COLUMN: Teams-style Chat Sidebar */}
-            <div className="w-112.5 flex-none bg-slate-50 border-r border-slate-200 flex flex-col shadow-xl z-10 h-full">
-              
-              {/* Header */}
-              <div className="p-4 border-b border-slate-200 flex items-center justify-between bg-white shadow-sm z-10 gap-4">
-                
-                {/* LEFT SIDE: Action Buttons Grouped Together */}
-                <div className="flex items-center gap-2">
-                  <button 
-                    onClick={() => setSelectedSubmission(null)} 
-                    className="px-3 py-1.5 bg-slate-100 text-slate-700 rounded hover:bg-slate-200 text-xs font-bold flex items-center gap-1 transition-colors shrink-0"
-                  >
-                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
-                    Queue
-                  </button>
+      {showAuditModal && (
+        <AuditModal 
+          submission={selectedSubmission} 
+          onClose={() => setShowAuditModal(false)} 
+        />
+      )}
+    </div>
+  );
+}
 
-                  <button 
-                    onClick={() => setShowAuditModal(true)}
-                    className="px-3 py-1.5 bg-white border border-slate-200 text-slate-700 rounded hover:bg-slate-50 text-xs font-bold shadow-sm flex items-center gap-1.5 transition-colors shrink-0"
-                    title="View Full AI Audit Log"
-                  >
-                    <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg>
-                    Audit Log
-                  </button>
-                </div>
+// --- 🏗️ SUB-COMPONENTS ---
 
-                {/* RIGHT SIDE: Title */}
-                <div className="text-right overflow-hidden">
-                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Reviewing</p>
-                  <p className="text-sm font-bold text-slate-800 truncate max-w-37.5" title={selectedSubmission.aif_state.project_narratives?.[0]?.project_name}>
-                    {selectedSubmission.aif_state.project_narratives?.[0]?.project_name || 'Unnamed Project'}
-                  </p>
-                </div>
-              </div>
+function LoadingOverlay() {
+  return (
+    <div className="fixed inset-0 z-250 bg-slate-900/60 backdrop-blur-sm flex flex-col items-center justify-center animate-in fade-in duration-200">
+      <div className="bg-white p-8 rounded-2xl shadow-2xl flex flex-col items-center">
+        <div className="animate-spin h-12 w-12 text-blue-600 mb-6 border-4 border-slate-200 border-t-blue-600 rounded-full"></div>
+        <h2 className="text-2xl font-bold text-slate-800 mb-2">Agent is Auditing</h2>
+        <p className="text-slate-500 text-sm">Cross-referencing technical narratives and guidelines...</p>
+      </div>
+    </div>
+  );
+}
 
-              {/* Chat History Area */}
-              <div className="flex-1 overflow-y-auto p-6 bg-slate-50 flex flex-col space-y-4">
-                <div className="flex justify-center mb-2">
-                  <div className="bg-white border border-slate-200 rounded-full px-4 py-1.5 text-xs font-bold text-slate-500 shadow-sm flex gap-4">
-                    <span>Completeness: <span className="text-emerald-600">{selectedSubmission.audit_summary.completeness_score}%</span></span>
-                    <span>Compliance: <span className="text-amber-600">{selectedSubmission.audit_summary.compliance_score}%</span></span>
-                  </div>
-                </div>
+const QueueView = ({ submissions, onOpen, onRefresh }: any) => {
+  const inProgress = submissions.filter((s: any) => s.has_been_audited && s.status !== 'Returned');
+  const newArrivals = submissions.filter((s: any) => !s.has_been_audited && s.status !== 'Returned');
+  const returned = submissions.filter((s: any) => s.status === 'Returned');
 
-                {/* MAPPED HUMAN CHAT MESSAGES */}
-                {humanMessages.length === 0 ? (
-                  <div className="text-center text-sm text-slate-400 italic my-auto">
-                    No messages yet. Send a chat to the client below.
-                  </div>
-                ) : (
-                  humanMessages.map((msg, idx) => (
-                    <div key={idx} className={`flex ${msg.sender === 'tax_team' ? 'justify-end' : 'justify-start'}`}>
-                      <div className={`max-w-[85%] rounded-2xl p-3.5 shadow-sm text-[13px] leading-relaxed whitespace-pre-wrap ${
-                        msg.sender === 'tax_team' 
-                          ? 'bg-blue-600 text-white rounded-br-none' 
-                          : 'bg-white border border-slate-200 text-slate-700 rounded-bl-none'
-                      }`}>
-                        <div className={`text-[10px] font-bold mb-1 uppercase tracking-wider ${msg.sender === 'tax_team' ? 'text-blue-200' : 'text-slate-400'}`}>
-                          {msg.sender === 'tax_team' ? 'You (Tax Team)' : 'Client'}
-                        </div>
-                        {msg.message}
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-
-              {/* Compose Box */}
-              <div className="p-4 bg-white border-t border-slate-200 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)]">
-                <div className="border border-slate-300 rounded-xl overflow-hidden focus-within:ring-2 focus-within:ring-blue-500 focus-within:border-blue-500 transition-shadow bg-white flex flex-col">
-                  
-                  <textarea 
-                    className="w-full h-32 p-4 text-[13px] text-slate-800 bg-white focus:outline-none resize-none custom-scrollbar leading-relaxed"
-                    value={chatInput}
-                    onChange={(e) => setChatInput(e.target.value)}
-                    placeholder="Type a message to the client..."
-                  />
-                  
-                  <div className="flex justify-between items-center p-3 border-t border-slate-100 bg-slate-50">
-                     
-                     {/* LEFT SIDE: Formal Document Actions */}
-                     <div className="flex gap-2">
-                       <button 
-                          onClick={approveAIF}
-                          className="text-xs font-bold text-emerald-700 bg-emerald-100 hover:bg-emerald-200 px-3 py-1.5 rounded transition-colors flex items-center gap-1"
-                          title="Formally approve this AIF"
-                       >
-                          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
-                          Approve
-                       </button>
-                       <button 
-                          onClick={returnToClient}
-                          className="text-xs font-bold text-amber-700 bg-amber-100 hover:bg-amber-200 px-3 py-1.5 rounded transition-colors flex items-center gap-1"
-                          title="Return document to client's queue"
-                       >
-                          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 14 4 9l5-5"></path><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5v0a5.5 5.5 0 0 1-5.5 5.5H11"></path></svg>
-                          Return AIF
-                       </button>
-                     </div>
-                     
-                    {/* RIGHT SIDE: Send Chat Button */}
-                    <button 
-                      onClick={sendChatMessage}
-                      disabled={!chatInput.trim()}
-                      className="px-4 py-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition shadow-sm disabled:opacity-50 text-xs font-bold flex items-center gap-2"
-                    >
-                      Send Chat
-                      <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* RIGHT COLUMN: The Physical Document Viewer */}
-            <div 
-              className="flex-1 bg-[#E2E8F0] overflow-y-auto p-12 custom-scrollbar relative flex justify-center"
-              onClick={() => setActiveComment(null)} 
-            >
-              <div className="w-198.5 min-w-198.5 flex-none relative" style={{ marginRight: activeComment ? '350px' : '0', transition: 'margin 0.3s ease-in-out' }}>
-                <div className="flex flex-col gap-12">
-                  
-                  {/* PROJECT SUBMISSION DOCUMENT */}
-                  <div className="w-full min-h-280.75 bg-white shadow-xl p-16 relative flex flex-col">
-                    <div className="flex justify-between items-start mb-10 border-b-2 border-slate-800 pb-4">
-                      <div>
-                         <h1 className="text-2xl font-bold uppercase tracking-wide font-serif text-black">RDEC Project Contribution</h1>
-                         <p className="text-sm font-serif text-slate-500 mt-1">Internal Tax Team Submission</p>
-                      </div>
-                      <span className="text-xs text-slate-500 font-sans uppercase">Confidential</span>
-                    </div>
-
-                    {/* Section 1: Project Overview */}
-                    <div className="mb-10 font-serif">
-                      <h2 className="text-lg font-bold bg-slate-100 p-2 mb-6 border-l-4 border-slate-800 font-sans text-slate-900">1. Project Overview</h2>
-                      <div className="grid grid-cols-2 gap-y-6 gap-x-8 px-2">
-                        <div className="col-span-2">
-                           <span className="font-bold text-slate-500 text-[10px] uppercase block mb-1">Project Name</span> 
-                           <span className="text-[16px] text-slate-900 font-bold">{selectedSubmission.aif_state.project_narratives?.[0]?.project_name || 'Unnamed Project'}</span>
-                        </div>
-                        <div className="col-span-2">
-                           <span className="font-bold text-slate-500 text-[10px] uppercase block mb-1">Lead Competent Professional</span> 
-                           <span className="text-[15px] text-slate-900 font-semibold leading-relaxed">{selectedSubmission.aif_state.company_details?.competent_professional_details || 'Not provided'}</span>
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Section 2: Project Financials */}
-                    <div className="mb-10 font-serif">
-                      <h2 className="text-lg font-bold bg-slate-100 p-2 mb-6 border-l-4 border-slate-800 font-sans text-slate-900">2. Project Financials</h2>
-                      <div className="px-2">
-                          <table className="w-2/3 text-left text-[15px] border-collapse">
-                            <tbody className="divide-y divide-slate-200">
-                              <tr><td className="py-3 text-slate-700">Staff Costs</td><td className="py-3 text-right font-semibold text-slate-900">£{selectedSubmission.aif_state.financials?.staff_costs || '0'}</td></tr>
-                              <tr><td className="py-3 text-slate-700">Subcontractors</td><td className="py-3 text-right font-semibold text-slate-900">£{selectedSubmission.aif_state.financials?.subcontractor_costs || '0'}</td></tr>
-                              <tr>
-                                <td className="py-3 text-slate-700">Software</td>
-                                <td className="py-3 text-right">
-                                   <Highlight issueId="financials" text="Software Costs">
-                                     £{selectedSubmission.aif_state.financials?.software || '0'}
-                                   </Highlight>
-                                </td>
-                              </tr>
-                              <tr><td className="py-3 text-slate-700">Cloud Computing</td><td className="py-3 text-right font-semibold text-slate-900">£{selectedSubmission.aif_state.financials?.cloud || '0'}</td></tr>
-                            </tbody>
-                          </table>
-                      </div>
-                    </div>
-
-                    {/* Section 3: Technical Narrative */}
-                    <div className="mb-10 font-serif flex-1">
-                      <h2 className="text-lg font-bold bg-slate-100 p-2 mb-6 border-l-4 border-slate-800 font-sans text-slate-900">3. Technical Narrative</h2>
-                      
-                      {(() => {
-                        const proj = selectedSubmission.aif_state.project_narratives?.[0] || {};
-                        return (
-                          <div className="space-y-8 text-[15px] leading-relaxed text-slate-800 px-2">
-                            <div>
-                              <p className="font-bold text-slate-500 text-[10px] uppercase font-sans mb-1">A. Advance Sought</p>
-                              <p>{proj.advance_sought || 'Not provided'}</p>
-                            </div>
-                            <div>
-                              <p className="font-bold text-slate-500 text-[10px] uppercase font-sans mb-1">B. Scientific Uncertainties & Professional Baseline</p>
-                              <p>
-                                <Highlight issueId="narrative" text="Scientific Uncertainties">
-                                  {proj.scientific_uncertainties || 'Not provided'}
-                                </Highlight>
-                              </p>
-                            </div>
-                            <div>
-                              <p className="font-bold text-slate-500 text-[10px] uppercase font-sans mb-1">C. Activities & Outcomes (Including Failures)</p>
-                              <p>
-                                <Highlight issueId="activities" text="Activities & Outcomes">
-                                  {proj.outcomes || 'Not provided'}
-                                </Highlight>
-                              </p>
-                            </div>
-                          </div>
-                        );
-                      })()}
-                    </div>
-
-                    {/* Section 4: Compliance Flags */}
-                    <div className="font-serif mt-auto pt-8 border-t border-slate-200">
-                      <h2 className="text-lg font-bold bg-slate-100 p-2 mb-6 border-l-4 border-slate-800 font-sans text-slate-900">4. Project Compliance Flags</h2>
-                      <div className="grid grid-cols-2 gap-4 px-2">
-                         <div className="flex justify-between border-b border-slate-100 pb-2">
-                           <span className="text-sm text-slate-700">Overseas R&D?</span>
-                           <span className="font-semibold text-slate-900 text-sm">{selectedSubmission.aif_state.compliance?.overseas_rnd ? 'Yes' : 'No'}</span>
-                        </div>
-                        <div className="flex justify-between border-b border-slate-100 pb-2">
-                           <span className="text-sm text-slate-700">AI / Machine Learning Used?</span>
-                           <span className="font-semibold text-slate-900 text-sm">{selectedSubmission.aif_state.compliance?.ai_used ? 'Yes' : 'No'}</span>
-                        </div>
-                      </div>
-                    </div>
-
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
+  return (
+    <div className="flex-1 p-8 space-y-12 overflow-y-auto">
+      <div className="flex justify-between items-end max-w-5xl mx-auto">
+        <div>
+          <h2 className="text-3xl font-bold text-slate-900 mb-2">AIF Triage Queue</h2>
+          <p className="text-slate-500">Review and audit client submissions before generating official HMRC documents.</p>
+        </div>
+        <button onClick={onRefresh} className="px-4 py-2 bg-white border border-slate-200 text-slate-600 rounded-lg shadow-sm hover:bg-slate-50 text-sm font-semibold transition-colors">
+          Refresh Queue
+        </button>
       </div>
 
-      {/* --- AUDIT LOG MODAL --- */}
-      {showAuditModal && selectedSubmission && (
-        <div className="fixed inset-0 z-100 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-200">
-          <div className="bg-slate-50 rounded-2xl shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col overflow-hidden">
-            
-            {/* Modal Header */}
-            <div className="p-6 bg-white border-b border-slate-200 flex justify-between items-center z-10">
-              <div>
-                <h2 className="text-xl font-bold text-slate-900">Document Creation Audit Log</h2>
-                <p className="text-xs text-slate-500 font-medium mt-1">
-                  Raw audit log for {selectedSubmission.aif_state.project_narratives?.[0]?.project_name || 'Unnamed Project'}
-                </p>
-              </div>
-              <div className="flex gap-3">
-                <button 
-                  onClick={downloadAuditAsWord}
-                  className="px-4 py-2 bg-blue-600 text-white text-sm font-bold rounded-lg hover:bg-blue-700 shadow-sm flex items-center gap-2 transition"
-                >
-                  <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
-                  Export to Word
-                </button>
-                <button 
-                  onClick={() => setShowAuditModal(false)}
-                  className="px-4 py-2 bg-white border border-slate-300 text-slate-600 text-sm font-bold rounded-lg hover:bg-slate-100 transition"
-                >
-                  Close
-                </button>
-              </div>
-            </div>
+      <div className="max-w-5xl mx-auto space-y-12">
+        {/* 🟢 NEW ARRIVALS */}
+        <section>
+          <h3 className="text-xs font-black uppercase text-slate-400 mb-4 tracking-widest">New Arrivals</h3>
+          <div className="grid grid-cols-1 gap-4">
+            {newArrivals.length === 0 ? <p className="text-sm text-slate-400 italic">No new submissions.</p> : null}
+            {newArrivals.map((sub: SubmissionSummary) => (
+              <SubmissionCard key={sub.id} sub={sub} onOpen={onOpen} buttonText="Start Audit" />
+            ))}
+          </div>
+        </section>
 
-            {/* Modal Body: Formatted Q&A */}
-            <div className="p-8 overflow-y-auto flex-1 space-y-6 custom-scrollbar">
-              {selectedSubmission.audit_summary?.detailed_log?.map((log: AuditLogEntry, i: number) => (
-                <div key={i} className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm relative">
-                  <div className="absolute top-4 right-6 text-xs font-semibold text-slate-400">
-                    {new Date(log.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                  </div>
-                  
-                  <div className="mb-4 pr-16">
-                    <span className="text-xs font-black uppercase text-slate-400 block mb-1 tracking-wider">AI Interviewer</span>
-                    <p className="text-slate-800 text-[15px] leading-relaxed">{log.ai_question}</p>
-                  </div>
-                  
-                  <div className="bg-blue-50/50 p-4 rounded-lg border border-blue-100 mb-3">
-                    <span className="text-xs font-black uppercase text-blue-600 block mb-1 tracking-wider">Client Response</span>
-                    <p className="text-blue-900 text-[15px] leading-relaxed">{log.user_answer}</p>
-                  </div>
-                  
-                  {log.extracted_fields && log.extracted_fields.length > 0 && (
-                    <div className="mt-4 pt-3 border-t border-slate-100 flex items-center gap-2">
-                      <svg className="text-emerald-500" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
-                      <span className="text-[11px] font-mono font-bold text-emerald-600 uppercase">
-                        Fields Extracted: {log.extracted_fields.join(", ")}
-                      </span>
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-            
+        {/* 🔴 RETURNED FOR EDITS */}
+        <section>
+          <h3 className="text-xs font-black uppercase text-slate-400 mb-4 tracking-widest">Awaiting Client Edits (Returned)</h3>
+          <div className="grid grid-cols-1 gap-4">
+            {returned.length === 0 ? <p className="text-sm text-slate-400 italic">No returned submissions.</p> : null}
+            {returned.map((sub: SubmissionSummary) => (
+              <SubmissionCard key={sub.id} sub={sub} onOpen={onOpen} buttonText="View Sent Docs" />
+            ))}
+          </div>
+        </section>
+
+        {/* 🔵 IN PROGRESS */}
+        <section>
+          <h3 className="text-xs font-black uppercase text-slate-400 mb-4 tracking-widest">Currently Auditing</h3>
+          <div className="grid grid-cols-1 gap-4">
+            {inProgress.length === 0 ? <p className="text-sm text-slate-400 italic">No audits in progress.</p> : null}
+            {inProgress.map((sub: SubmissionSummary) => (
+              <SubmissionCard key={sub.id} sub={sub} onOpen={onOpen} buttonText="Continue Review" />
+            ))}
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+};
+
+function WorkbenchView({ 
+  submission, messages, analysis, chatInput, setChatInput, activeComment, setActiveComment, 
+  onBack, onShowAudit, onSendChat, onApprove, onReturn, manualInstruction, setManualInstruction, 
+  handleManualReRun, isAnalyzing, dismissedIssues, handleDismissIssue, isReturned 
+}: any) {
+  const proj = submission.aif_state.project_narratives?.[0] || {};
+
+  // Local state for toggling the AI Steerage controls
+  const [isControlsOpen, setIsControlsOpen] = useState(false);
+  
+  return (
+    <div className="flex-1 flex w-full h-full overflow-hidden">
+      
+      {/* --- Sidebar Chat --- */}
+      <div className="w-112.5 flex-none bg-slate-50 border-r border-slate-200 flex flex-col shadow-xl z-10 h-full">
+        <div className="p-4 border-b border-slate-200 flex items-center justify-between bg-white shadow-sm z-10">
+          <div className="flex items-center gap-2">
+            <button onClick={onBack} className="px-3 py-1.5 bg-slate-100 text-slate-700 rounded hover:bg-slate-200 text-xs font-bold">Queue</button>
+            <button onClick={onShowAudit} className="px-3 py-1.5 bg-white border border-slate-200 text-slate-700 rounded text-xs font-bold shadow-sm">Audit Log</button>
+          </div>
+          <div className="flex items-center gap-4 text-right">
+             <div className="hidden lg:block relative group cursor-help">
+                 <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Confidence</p>
+                 <p className={`text-sm font-black ${analysis?.confidence_score > 80 ? 'text-emerald-500' : 'text-amber-500'}`}>
+                    {analysis?.confidence_score || 0}%
+                 </p>
+                 
+                 {/* The Hover Tooltip */}
+                 {analysis?.confidence_explanation && (
+                   <div className="absolute right-0 top-full mt-2 w-72 p-4 bg-slate-800 text-slate-100 text-[11px] rounded-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all shadow-2xl z-50 text-left cursor-default">
+                     <p className="font-bold text-blue-400 mb-1.5 uppercase tracking-wider text-[9px]">Score Rationale</p>
+                     <p className="leading-relaxed mb-3">{analysis.confidence_explanation}</p>
+                     
+                     {/* AI Disclaimer */}
+                     <div className="pt-2.5 border-t border-slate-700">
+                        <p className="text-[9px] text-slate-400 italic leading-snug flex items-start gap-1.5">
+                          <svg className="w-3 h-3 shrink-0 mt-px text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+                          <span>AI can make mistakes. This score is automated guidance—please apply professional discretion before final approval.</span>
+                        </p>
+                     </div>
+
+                     {/* Triangle Pointer */}
+                     <div className="absolute -top-1 right-6 w-3 h-3 bg-slate-800 rotate-45"></div>
+                   </div>
+                 )}
+             </div>
+             <div className="w-px h-6 bg-slate-200"></div>
+             <div>
+                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Reviewing</p>
+                <p className="text-sm font-bold text-slate-800 truncate max-w-37.5">{proj.project_name || 'Unnamed'}</p>
+             </div>
           </div>
         </div>
-      )}
 
+        <div className="flex-1 overflow-y-auto p-6 bg-slate-50 flex flex-col space-y-4">
+          {messages.map((msg: any, i: number) => (
+             <div key={i} className={`flex ${msg.sender === 'tax_team' ? 'justify-end' : 'justify-start'}`}>
+               <div className={`max-w-[85%] rounded-2xl p-3.5 shadow-sm text-[13px] leading-relaxed ${msg.sender === 'tax_team' ? 'bg-blue-600 text-white rounded-br-none' : 'bg-white border border-slate-200 text-slate-700 rounded-bl-none'}`}>
+                 <div className={`text-[10px] font-bold mb-1 uppercase tracking-wider ${msg.sender === 'tax_team' ? 'text-blue-200' : 'text-slate-400'}`}>
+                   {msg.sender === 'tax_team' ? 'Tax Team' : 'Client'}
+                 </div>
+                 {msg.message}
+               </div>
+             </div>
+          ))}
+        </div>
+
+        <div className="p-4 bg-white border-t border-slate-200 shadow-inner">
+          <textarea 
+            className="w-full h-32 p-4 text-[13px] border text-slate-800 border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none mb-3"
+            value={chatInput} 
+            onChange={(e) => setChatInput(e.target.value)}
+            placeholder="Type message..." 
+          />
+          <div className="flex justify-between">
+            <div className="flex gap-2">
+               <button 
+                 onClick={onApprove} 
+                 disabled={isReturned}
+                 className={`text-xs font-bold px-3 py-1.5 rounded transition-colors ${isReturned ? 'bg-slate-100 text-slate-400 cursor-not-allowed' : 'text-emerald-700 bg-emerald-100 hover:bg-emerald-200'}`}
+               >
+                 Approve
+               </button>
+               <button 
+                 onClick={onReturn} 
+                 disabled={isReturned}
+                 className={`text-xs font-bold px-3 py-1.5 rounded transition-colors ${isReturned ? 'bg-slate-100 text-slate-400 cursor-not-allowed' : 'text-amber-700 bg-amber-100 hover:bg-amber-200'}`}
+               >
+                 Return AIF
+               </button>
+            </div>
+            <button onClick={onSendChat} className="px-4 py-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-xs font-bold">Send Chat</button>
+          </div>
+        </div>
+      </div>
+
+      {/* --- Document Viewer --- */}
+      <div className={`flex-1 bg-[#E2E8F0] overflow-y-auto p-12 custom-scrollbar relative flex justify-center ${isReturned ? 'grayscale opacity-75' : ''}`} onClick={() => setActiveComment(null)}>
+          
+          {/* AI Steerage Toggle & Box */}
+          <div className={`fixed top-24 right-12 z-30 transition-all ${isReturned ? 'opacity-50 pointer-events-none' : ''}`}>
+            {!isControlsOpen ? (
+              <div className="group relative flex items-center">
+                {/* Tooltip */}
+                <div className="absolute right-full mr-4 px-3 py-1.5 bg-slate-800 text-white text-xs font-bold rounded-lg opacity-0 group-hover:opacity-100 transition-all translate-x-2 group-hover:translate-x-0 pointer-events-none whitespace-nowrap shadow-lg">
+                  Re-run Agent Analysis
+                  <div className="absolute top-1/2 -right-1 -translate-y-1/2 w-2 h-2 bg-slate-800 rotate-45"></div>
+                </div>
+                {/* Floating Action Button */}
+                <button 
+                  onClick={() => setIsControlsOpen(true)}
+                  className="w-14 h-14 bg-white border border-slate-200 shadow-xl rounded-full flex items-center justify-center text-blue-600 hover:bg-blue-50 hover:scale-105 transition-all active:scale-95"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>
+                </button>
+              </div>
+            ) : (
+              <div className="w-80 bg-white/95 backdrop-blur-md border border-slate-200 shadow-2xl rounded-2xl p-5 animate-in zoom-in-95 duration-200 origin-top-right">
+                <div className="flex items-center justify-between mb-4">
+                  <div className="flex items-center gap-2">
+                    <span className="flex h-2.5 w-2.5 relative">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-blue-500"></span>
+                    </span>
+                    <span className="text-xs font-bold text-slate-800 uppercase tracking-widest">Agent Controls</span>
+                  </div>
+                  <button 
+                    onClick={() => setIsControlsOpen(false)} 
+                    className="text-slate-400 hover:text-slate-600 transition-colors bg-slate-100 hover:bg-slate-200 rounded-full p-1.5"
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                  </button>
+                </div>
+
+                <textarea 
+                  value={manualInstruction}
+                  onChange={(e) => setManualInstruction(e.target.value)}
+                  disabled={isReturned}
+                  placeholder="Add specific context or leave blank for a standard re-scan..."
+                  className="w-full text-[13px] p-3 rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:ring-2 focus:ring-blue-500 outline-none resize-none text-slate-700 placeholder:text-slate-400 transition-all shadow-inner mb-3"
+                  rows={3}
+                />
+                
+                <button 
+                  onClick={() => {
+                    handleManualReRun();
+                  }}
+                  disabled={isAnalyzing || isReturned}
+                  className="w-full py-2.5 bg-blue-600 text-white rounded-xl text-[13px] font-bold hover:bg-blue-700 disabled:opacity-50 transition-all shadow-sm flex items-center justify-center gap-2 active:scale-95"
+                >
+                  {isAnalyzing ? (
+                    <>
+                      <svg className="animate-spin h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                      Re-Analyzing...
+                    </>
+                  ) : 'Run Analysis'}
+                </button>
+
+                <p className="text-[10px] text-slate-400 mt-3 text-center leading-relaxed">
+                  {isReturned ? "AIF is locked while awaiting client edits." : "Re-evaluate the document to update compliance scores and active flags."}
+                </p>
+              </div>
+            )}
+          </div>
+
+          {/* The Physical Paper */}
+          <div className={`w-187.5 bg-white shadow-2xl p-16 pb-24 h-fit shrink-0 min-h-264 relative text-slate-900 ${isReturned ? 'pointer-events-none' : 'pointer-events-auto'}`} style={{ marginRight: activeComment ? '350px' : '0', transition: 'margin 0.3s' }}>
+            <div className="flex justify-between items-start mb-10 border-b-2 border-slate-800 pb-4">
+              <div>
+                <h1 className="text-2xl font-bold uppercase tracking-wide font-serif text-black">Technical Project Narrative</h1>
+                <p className="text-sm font-serif text-slate-500 mt-1">Internal Tax Team Submission</p>
+              </div>
+              <span className="text-xs text-slate-400 font-sans uppercase font-bold">Confidential</span>
+            </div>
+            
+            {/* 1. Project Overview */}
+            <h2 className="text-lg font-bold bg-slate-100 p-2 mb-6 border-l-4 border-slate-800 text-slate-900 font-sans">1. Project Overview</h2>
+            <div className="grid grid-cols-2 gap-y-6 gap-x-8 px-2 mb-10">
+              <div className="col-span-2">
+                <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Project Name</p>
+                <p className="font-bold text-slate-900 text-lg">{proj.project_name || 'Unnamed Project'}</p>
+              </div>
+              <div className="col-span-2">
+                <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Lead Competent Professional</p>
+                <Highlight 
+                  issueId="competent_professional" 
+                  analysis={analysis} 
+                  activeComment={activeComment} 
+                  setActiveComment={setActiveComment} 
+                  isDismissed={dismissedIssues.includes('competent_professional')} 
+                  onDismiss={handleDismissIssue}
+                >
+                  <span className="font-semibold text-slate-800 leading-relaxed">
+                    {proj.competent_professional || 'No technical lead identified'}
+                  </span>
+                </Highlight>
+              </div>
+            </div>
+
+            {/* 2. Technical Narrative */}
+            <h2 className="text-lg font-bold bg-slate-100 p-2 mb-6 border-l-4 border-slate-800 text-slate-900 font-sans">2. Technical Narrative</h2>
+            <div className="space-y-8 text-[15px] leading-relaxed text-slate-800 px-2">
+              <div>
+                <p className="font-bold text-slate-500 text-[10px] uppercase font-sans mb-1">A. Advance Sought</p>
+                <Highlight issueId="advance" analysis={analysis} activeComment={activeComment} setActiveComment={setActiveComment} isDismissed={dismissedIssues.includes('advance')} onDismiss={handleDismissIssue}> 
+                  {proj.advance_sought || 'Not provided'}
+                </Highlight>
+              </div>
+
+              <div>
+                <p className="font-bold text-slate-500 text-[10px] uppercase font-sans mb-1">B. Scientific Uncertainties</p>
+                <Highlight issueId="uncertainties" analysis={analysis} activeComment={activeComment} setActiveComment={setActiveComment} isDismissed={dismissedIssues.includes('uncertainties')} onDismiss={handleDismissIssue}>
+                  {proj.scientific_uncertainties || 'Not provided'}
+                </Highlight>
+              </div>
+
+              <div>
+                <p className="font-bold text-slate-500 text-[10px] uppercase font-sans mb-1">C. Why it was unresolvable</p>
+                <Highlight issueId="unresolvable" analysis={analysis} activeComment={activeComment} setActiveComment={setActiveComment} isDismissed={dismissedIssues.includes('unresolvable')} onDismiss={handleDismissIssue}>
+                  {proj.why_unresolvable_by_professional || 'Not provided'}
+                </Highlight>
+              </div>
+
+              <div>
+                <p className="font-bold text-slate-500 text-[10px] uppercase font-sans mb-1">D. Activities Undertaken</p>
+                <Highlight issueId="activities" analysis={analysis} activeComment={activeComment} setActiveComment={setActiveComment} isDismissed={dismissedIssues.includes('activities')} onDismiss={handleDismissIssue}>
+                  {proj.activities_undertaken || 'Not provided'}
+                </Highlight>
+              </div>
+
+              <div>
+                <p className="font-bold text-slate-500 text-[10px] uppercase font-sans mb-1">E. Project Outcomes</p>
+                <Highlight issueId="outcomes" analysis={analysis} activeComment={activeComment} setActiveComment={setActiveComment} isDismissed={dismissedIssues.includes('outcomes')} onDismiss={handleDismissIssue}>
+                  {proj.outcomes || 'Not provided'}
+                </Highlight>
+              </div>
+            </div>
+
+            {/* 3. Compliance Flags */}
+            <div className="mt-12 pt-8 border-t border-slate-200">
+              <h2 className="text-lg font-bold bg-slate-100 p-2 mb-6 border-l-4 border-slate-800 text-slate-900 font-sans">3. Compliance Flags</h2>
+              <div className="grid grid-cols-2 gap-x-12 gap-y-4 px-2">
+                <div className="flex justify-between border-b border-slate-100 pb-2">
+                  <span className="text-sm text-slate-600">Overseas R&D?</span>
+                  <span className="font-bold text-slate-900 text-sm">{submission.aif_state.compliance?.overseas_rnd ? 'Yes' : 'No'}</span>
+                </div>
+                <div className="flex justify-between border-b border-slate-100 pb-2">
+                  <span className="text-sm text-slate-600">AI Used?</span>
+                  <span className="font-bold text-slate-900 text-sm">{submission.aif_state.compliance?.ai_used ? 'Yes' : 'No'}</span>
+                </div>
+                <div className="flex justify-between border-b border-slate-100 pb-2">
+                  <span className="text-sm text-slate-600">Quantum Used?</span>
+                  <span className="font-bold text-slate-900 text-sm">{submission.aif_state.compliance?.quantum_used ? 'Yes' : 'No'}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+      </div>
     </div>
   );
 }

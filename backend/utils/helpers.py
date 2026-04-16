@@ -3,7 +3,12 @@ from docx import Document
 from docx.shared import Pt, Inches
 from datetime import datetime
 from google.adk.sessions import InMemorySessionService
-from google.adk.runners import Runner 
+from google.adk.runners import Runner
+import json
+import asyncio
+from core.config import file_io_lock, logger, ephemeral_audit_logs
+
+file_io_lock = asyncio.Lock()
 
 # ==========================================
 # 1. GOOGLE ADK UTILITIES
@@ -54,98 +59,73 @@ def extract_text_from_events(events):
 
 def generate_rdec_docx(aif_state: dict, session_id: str):
     """
-    Takes the completed AIF JSON state and compiles a formatted Word document.
+    Generates a technical-only RDEC document. 
+    Removes Company Details, Project Summaries, and Financial tables.
     """
-    print(f"📝 Generating RDEC Word Document for session {session_id}...")
+    print(f"📝 Generating Technical-Only Word Document for session {session_id}...")
     
     doc = Document()
     
     # --- Title ---
-    title = doc.add_heading('RDEC Additional Information Form (AIF)', 0)
-    title.alignment = 1 # Center align
-    doc.add_paragraph(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n").alignment = 1
+    title = doc.add_heading('RDEC Technical Narrative Report', 0)
+    title.alignment = 1 
+    doc.add_paragraph(f"Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n").alignment = 1
 
-    # --- Section A: Company Details ---
-    doc.add_heading('A. Company & Claim Details', level=1)
-    company = aif_state.get('company_details', {})
-    doc.add_paragraph(f"Company Name: {company.get('company_name', 'Not Provided')}")
-    doc.add_paragraph(f"UTR: {company.get('utr', 'Not Provided')}")
-    doc.add_paragraph(f"Accounting Period: {company.get('accounting_period', 'Not Provided')}")
-    doc.add_paragraph(f"Competent Professional: {company.get('competent_professional_details', 'Not Provided')}")
-    doc.add_paragraph(f"RDEC Eligibility Reason: {company.get('rdec_eligibility_reason', 'Not Provided')}")
-    doc.add_paragraph(f"First-Time Claimant: {'Yes' if company.get('first_time_claimant') else 'No'}")
-
-    # --- Section B: Project Summary ---
-    doc.add_heading('B. Project Summary', level=1)
-    summary = aif_state.get('project_summary', {})
-    doc.add_paragraph(f"Total Projects: {summary.get('total_projects', 0)}")
-    doc.add_paragraph(f"Projects Described in this AIF: {summary.get('projects_to_describe', 0)}")
-    doc.add_paragraph(f"Qualifying Expenditure Covered: {summary.get('qualifying_expenditure_percentage', 0)}%")
-    doc.add_paragraph(f"Selection Reason:\n{summary.get('selection_reason', 'Not Provided')}")
-
-    # --- Section C: Financials ---
-    doc.add_heading('C. Scheme-Level Financial Breakdown', level=1)
-    fin = aif_state.get('financials', {})
-    table = doc.add_table(rows=1, cols=2)
-    table.style = 'Table Grid'
-    hdr_cells = table.rows[0].cells
-    hdr_cells[0].text = 'Category'
-    hdr_cells[1].text = 'Cost (£)'
-    
-    categories = [
-        ('Staff Costs', 'staff_costs'), ('EPWs', 'epw_costs'), 
-        ('Subcontractors', 'subcontractor_costs'), ('Consumables', 'consumables'),
-        ('Software', 'software'), ('Cloud Computing', 'cloud_computing'),
-        ('Prototyping', 'prototyping'), ('Other RDEC Categories', 'other_rdec_categories')
-    ]
-    
-    for label, key in categories:
-        row_cells = table.add_row().cells
-        row_cells[0].text = label
-        row_cells[1].text = f"£ {fin.get(key, 0):,.2f}" if fin.get(key) else "£ 0.00"
-
-    # --- Section D: Project Narratives ---
-    doc.add_heading('D. Project Narratives', level=1)
+    # --- Section 1: Project Narratives ---
+    # This is now the primary focus of the document
+    doc.add_heading('1. Project Technical Narratives', level=1)
     narratives = aif_state.get('project_narratives', [])
     
     if not narratives:
-        doc.add_paragraph("No specific project narratives provided.")
+        doc.add_paragraph("No technical narratives were generated for this session.")
     else:
         for idx, proj in enumerate(narratives, 1):
-            doc.add_heading(f"Project {idx}: {proj.get('project_name', 'Unnamed Project')}", level=2)
-            doc.add_paragraph(f"Advance Sought:\n{proj.get('advance_sought', 'Not Provided')}")
-            doc.add_paragraph(f"Scientific/Technological Uncertainties:\n{proj.get('scientific_uncertainties', 'Not Provided')}")
-            doc.add_paragraph(f"Why uncertainties could not be resolved by a competent professional:\n{proj.get('why_unresolvable_by_professional', 'Not Provided')}")
-            doc.add_paragraph(f"Activities Undertaken:\n{proj.get('activities_undertaken', 'Not Provided')}")
-            doc.add_paragraph(f"Outcomes & Failures:\n{proj.get('outcomes_and_failures', 'Not Provided')}")
-            doc.add_paragraph(f"Project Level Costs: £ {proj.get('project_costs', 0):,.2f}")
+            doc.add_heading(f"Project: {proj.get('project_name', 'Unnamed Project')}", level=2)
+            
+            # Competent Professional is critical to the narrative
+            doc.add_paragraph(f"Lead Competent Professional: {proj.get('competent_professional', 'Not Provided')}")
+            
+            # Technical Body
+            doc.add_heading('Advance in Science or Technology', level=3)
+            doc.add_paragraph(proj.get('advance_sought', 'Not Provided'))
+            
+            doc.add_heading('Technological Uncertainties', level=3)
+            doc.add_paragraph(proj.get('scientific_uncertainties', 'Not Provided'))
+            
+            doc.add_heading('Resolution of Uncertainties', level=3)
+            doc.add_paragraph(proj.get('why_unresolvable_by_professional', 'Not Provided'))
+            
+            doc.add_heading('Technical Activities Undertaken', level=3)
+            doc.add_paragraph(proj.get('activities_undertaken', 'Not Provided'))
+            
+            doc.add_heading('Project Outcomes', level=3)
+            doc.add_paragraph(proj.get('outcomes', 'Not Provided'))
+            
+            # Page break between projects if there are multiple
+            if len(narratives) > 1 and idx < len(narratives):
+                doc.add_page_break()
 
-    # --- Section E: Compliance ---
-    doc.add_heading('E. Mandatory Compliance Questions', level=1)
+    # --- Section 2: Mandatory Compliance Flags ---
+    doc.add_heading('2. Mandatory Compliance Flags', level=1)
     comp = aif_state.get('compliance', {})
     
     def yes_no(val):
         if val is None: return "Not Answered"
         return "Yes" if val else "No"
 
-    doc.add_paragraph(f"Overseas R&D? {yes_no(comp.get('overseas_rd'))}")
-    doc.add_paragraph(f"Overseas Subcontractors? {yes_no(comp.get('overseas_subcontractors'))}")
-    doc.add_paragraph(f"Overseas EPWs? {yes_no(comp.get('overseas_epws'))}")
-    doc.add_paragraph(f"AI Used? {yes_no(comp.get('ai_used'))}")
-    doc.add_paragraph(f"Mathematics Central? {yes_no(comp.get('mathematics_central'))}")
-    doc.add_paragraph(f"Quantum Technologies? {yes_no(comp.get('quantum_technologies'))}")
-    doc.add_paragraph(f"R&D performed at company address? {yes_no(comp.get('rd_at_company_address'))}")
-    doc.add_paragraph(f"Professional Adviser Involved? {yes_no(comp.get('professional_adviser_involved'))}")
-    doc.add_paragraph(f"Senior Officer Approval? {yes_no(comp.get('senior_officer_approval'))}")
-
-    # --- Save the Document ---
+    # Using the standardized keys we aligned earlier
+    doc.add_paragraph(f"Overseas R&D involved? {yes_no(comp.get('overseas_rnd'))}")
+    doc.add_paragraph(f"AI or Machine Learning utilized? {yes_no(comp.get('ai_used'))}")
+    doc.add_paragraph(f"Quantum Technologies involved? {yes_no(comp.get('quantum_used'))}")
+    
+    # --- Save Logic ---
     export_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'exports')
     os.makedirs(export_dir, exist_ok=True)
     
-    file_path = os.path.join(export_dir, f"AIF_{session_id}.docx")
+    file_path = os.path.join(export_dir, f"AIF_Technical_{session_id}.docx")
     doc.save(file_path)
-    print(f"✅ Document saved successfully to {file_path}")
     
+    print(f"✅ Technical document saved: {file_path}")
     return file_path
 
 def deep_merge(dict1, dict2):
@@ -156,3 +136,86 @@ def deep_merge(dict1, dict2):
         else:
             dict1[key] = value
     return dict1
+
+def determine_next_field(aif_state: dict) -> str:
+    """Properly scans the state dictionary for missing or weak fields."""
+    
+    # 1. Check the Project Narratives Array
+    narratives = aif_state.get("project_narratives", [])
+    if not narratives:
+        return "project_name" # Fallback if array is completely empty
+        
+    proj = narratives[0]
+    
+    # Define the exact sequential order we want to ask questions in
+    narrative_keys = [
+        "project_name", 
+        "competent_professional", 
+        "advance_sought", 
+        "scientific_uncertainties", 
+        "why_unresolvable_by_professional", 
+        "activities_undertaken", 
+        "outcomes"
+    ]
+    
+    for key in narrative_keys:
+        val = proj.get(key)
+        # Check if it's missing entirely
+        if val is None or val == "":
+            return key
+        # Check if Python flagged it as a weak draft
+        if isinstance(val, str) and "[WEAK_DRAFT]" in val:
+            return key
+            
+    # 2. Check the Compliance Fields (Aligned with DOCX generator)
+    compliance = aif_state.get("compliance", {})
+    # 🐛 FIXED: Keys now perfectly match the generate_rdec_docx schema
+    compliance_keys = ["overseas_rnd", "ai_used", "quantum_used"] 
+    
+    for key in compliance_keys:
+        val = compliance.get(key)
+        # For booleans, we strictly check for None (since False is a valid answer)
+        if val is None:
+            return key
+            
+    # If it survives all those checks, it is TRULY complete.
+    return "Complete"
+
+async def append_to_master_log(SUB_dir, SAVED_dir, session_id: str, actor: str, event_type: str, details: str):
+    # 1. Always store in the temporary memory buffer first
+    if session_id not in ephemeral_audit_logs:
+        ephemeral_audit_logs[session_id] = []
+        
+    new_entry = {
+        "timestamp": datetime.now().isoformat(),
+        "actor": actor,
+        "event_type": event_type,
+        "details": details
+    }
+    ephemeral_audit_logs[session_id].append(new_entry)
+
+    # 2. Try to find if the user has ALREADY saved a file
+    saved_path = os.path.join(SAVED_dir, f"{session_id}.json")
+    sub_path = os.path.join(SUB_dir, f"{session_id}.json")
+    
+    target_path = sub_path if os.path.exists(sub_path) else (saved_path if os.path.exists(saved_path) else None)
+
+    # 3. If a file exists, flush the memory to the disk!
+    if target_path:
+        async with file_io_lock:
+            with open(target_path, "r") as f:
+                data = json.load(f)
+            
+            if "audit_summary" not in data or data["audit_summary"] is None: 
+                data["audit_summary"] = {}
+            if "detailed_log" not in data["audit_summary"]: 
+                data["audit_summary"]["detailed_log"] = []
+            
+            # Dump all pending memory logs into the file
+            data["audit_summary"]["detailed_log"].extend(ephemeral_audit_logs[session_id])
+            
+            with open(target_path, "w") as f:
+                json.dump(data, f, indent=2)
+            
+            # Clear the temporary memory now that it's safely on disk
+            ephemeral_audit_logs[session_id] = []

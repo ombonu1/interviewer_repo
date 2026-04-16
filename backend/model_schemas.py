@@ -75,8 +75,8 @@ class ReviewerFeedback(BaseModel):
 class SaveSessionRequest(BaseModel):
     session_id: str
     aif_state: Dict[str, Any]
-    messages: List[Dict[str, str]]
-    audit_log: List[Dict[str, Any]]
+    status: str = "Draft"
+    messages: List[Dict[str, Any]] = []
 
 class HumanMessage(BaseModel):
     sender: str
